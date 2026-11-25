@@ -1,0 +1,11 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/sbombox-hq/action/security/advisories/new
+    about: Please report security issues privately, not in a public issue.
+  - name: Questions and support
+    url: https://sbombox.com/contact
+    about: Ask the SBOMBox team about setup, accounts or billing.
+  - name: Documentation
+    url: https://sbombox.com/docs/github-action
+    about: Setup, inputs, examples and troubleshooting.

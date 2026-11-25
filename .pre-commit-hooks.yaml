@@ -1,0 +1,11 @@
+# pre-commit hooks published by this repository (https://pre-commit.com).
+# Uses the sbombox CLI already on your PATH: install it once with
+#   curl -fsSL https://sbombox.com/install.sh | sh
+- id: sbombox-check
+  name: SBOM quality check (SBOMBox)
+  description: Generate an SBOM locally and fail the commit if its score is below --fail-under. Nothing is uploaded.
+  entry: sbombox check
+  language: system
+  pass_filenames: false
+  # Only when dependencies change: manifests and lockfiles.
+  files: (^|/)(package(-lock)?\.json|yarn\.lock|pnpm-lock\.yaml|pyproject\.toml|poetry\.lock|uv\.lock|requirements[^/]*\.txt|go\.(mod|sum)|Cargo\.(toml|lock)|pom\.xml|build\.gradle(\.kts)?|gradle\.lockfile)$

@@ -1,0 +1,59 @@
+# SBOMBox for GitLab CI: generate, score and upload an SBOM. Keyless - the job
+# proves its identity with a GitLab-issued OIDC token, so there is no secret
+# to create or rotate. One-time setup, from your checkout:
+#
+#   sbombox login && sbombox init      # picks the project and trusts this repo
+#
+# Then in .gitlab-ci.yml:
+#
+#   include:
+#     - remote: 'https://raw.githubusercontent.com/sbombox-hq/action/v1/gitlab/sbombox-component.yml'
+#   variables:
+#     SBOMBOX_PROJECT: "<project-uuid>"
+#
+# Optional variables: SBOMBOX_FAIL_UNDER (minimum score 0-10, default off),
+# SBOMBOX_FORMAT (cyclonedx|spdx), SBOMBOX_PATH (directory to scan),
+# SBOMBOX_UPLOAD (auto|true|false), SBOMBOX_VERSION (CLI version), and the
+# installer's SBOMBOX_GENERATORS / SBOMBOX_SYFT_VERSION. SBOMBOX_GENERATOR
+# forces which generator runs (e.g. npm-sbom, or cyclonedx-npm,syft); by
+# default npm 9.5+, pnpm 11.1+ and uv 0.9.11+ make the SBOM themselves when
+# the project has their lockfile.
+# Prefer a stored token? Set SBOMBOX_TOKEN as a masked variable instead.
+
+sbombox:
+  stage: test
+  image: python:3.12-slim
+  variables:
+    SBOMBOX_FORMAT: "cyclonedx"
+    SBOMBOX_PATH: "."
+    SBOMBOX_FAIL_UNDER: "0"
+    SBOMBOX_UPLOAD: "auto"
+  id_tokens:
+    # The CLI reads SBOMBOX_ID_TOKEN and exchanges it for a 15-minute,
+    # single-project upload token. The audience must match the API's.
+    SBOMBOX_ID_TOKEN:
+      aud: "sbombox-api"
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq curl >/dev/null
+    # One installer: the CLI plus a pinned, checksum-verified syft.
+    - curl -fsSL https://sbombox.com/install.sh | SBOMBOX_NO_MODIFY_PATH=1 sh
+    - export PATH="$HOME/.local/bin:$PATH"
+  script:
+    - sbombox generate --dir "$SBOMBOX_PATH" --format "$SBOMBOX_FORMAT" --output sbom.json
+    - sbombox score sbom.json --format detailed
+    # Upload before enforcing the gate, so failing runs are recorded too.
+    - |
+      if [ "$SBOMBOX_UPLOAD" = "false" ]; then
+        echo "Upload disabled."
+      elif [ -z "${SBOMBOX_TOKEN:-}" ] && [ -z "${SBOMBOX_ID_TOKEN:-}" ]; then
+        [ "$SBOMBOX_UPLOAD" = "true" ] && { echo "No credentials for upload."; exit 5; }
+        echo "No credentials (e.g. fork pipeline): skipping upload."
+      else
+        sbombox push sbom.json --project "$SBOMBOX_PROJECT"
+      fi
+    - sbombox score sbom.json --fail-under "$SBOMBOX_FAIL_UNDER"
+  artifacts:
+    when: always
+    paths:
+      - sbom.json
+    expire_in: 90 days

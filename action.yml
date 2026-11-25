@@ -1,0 +1,294 @@
+name: "SBOMBox SBOM Action"
+description: "Generate, score, check and upload an SBOM in one step. Keyless: no secrets needed."
+author: "SBOMBox"
+branding:
+  icon: "package"
+  color: "blue"
+
+# Minimal use (the job needs `permissions: id-token: write`):
+#
+#   - uses: actions/checkout@v7
+#   - uses: sbombox-hq/action@v1
+#     with:
+#       project: <project-uuid>
+#
+# Every run is recorded: the SBOM is uploaded (with the verified repository,
+# commit and run attached) *before* any quality gate fails the job, and a copy
+# is kept as a workflow artifact.
+
+inputs:
+  project:
+    description: "SBOMBox project UUID (or org/project slug). Not a secret."
+    required: true
+  path:
+    description: "Project directory to scan. Ignored when image is set."
+    required: false
+    default: "."
+  image:
+    description: >-
+      Container image to scan instead of a directory, e.g. ghcr.io/acme/api:1.4.0. Uses the SBOM BuildKit
+      attached to the image (docker buildx build --sbom=true) when there is one, else scans it with syft.
+      Private registries use the job's Docker login (run docker/login-action first).
+    required: false
+    default: ""
+  platform:
+    description: "With image: platform of a multi-platform image, e.g. linux/arm64. Default linux/amd64."
+    required: false
+    default: ""
+  format:
+    description: "SBOM format: cyclonedx or spdx."
+    required: false
+    default: "cyclonedx"
+  fail-under:
+    description: "Fail the job if the quality score (0-10) is below this. 0 turns the gate off."
+    required: false
+    default: "0"
+  profiles:
+    description: "Compliance profiles to check, comma-separated (e.g. ntia-2021). Shown in the job summary."
+    required: false
+    default: ""
+  upload:
+    description: >-
+      auto (default): upload when the job can authenticate, otherwise skip with a notice (e.g. pull
+      requests from forks). true: always upload, fail without credentials. false: never upload.
+    required: false
+    default: "auto"
+  token:
+    description: "Optional SBOMBox API token. Leave empty to authenticate keylessly with the job's OIDC identity."
+    required: false
+    default: ""
+  output:
+    description: "Where to write the SBOM."
+    required: false
+    default: "sbom.json"
+  artifact-name:
+    description: "Name of the workflow artifact holding the SBOM and score. Set per job in a matrix. Empty to skip."
+    required: false
+    default: "sbom"
+  version:
+    description: "Pin a CLI version, e.g. 0.2.0. Default: the current version published by SBOMBox (versions below its minimum are refused)."
+    required: false
+    default: "latest"
+  generators:
+    description: >-
+      SBOM generators to install: syft, cyclonedx-py, cyclonedx-npm, cdxgen, auto, all or none,
+      comma-separated. Empty (default) means auto: syft, cyclonedx-py, and cyclonedx-npm only when Node.js
+      is present with npm older than 9.5. npm 9.5+, pnpm 11.1+ and uv 0.9.11+ generate SBOMs themselves
+      and are used first when the project has their lockfile. Add cdxgen for Java/Gradle projects.
+    required: false
+    default: ""
+  generator:
+    description: >-
+      Force which generator runs, comma-separated in order of preference, e.g. npm-sbom or
+      cyclonedx-npm,syft. Empty (default) lets SBOMBox choose. Names: npm-sbom, pnpm-sbom,
+      pnpm-sbom-lockfile, uv-cyclonedx, cyclonedx-py, cyclonedx-npm, cargo-cyclonedx, cyclonedx-gomod,
+      cdxgen, syft.
+    required: false
+    default: ""
+  syft-version:
+    description: "syft version to install."
+    required: false
+    default: "v1.57.1"
+  installer-url:
+    description: "Installer to run. Point at an internal mirror if runners cannot reach sbombox.com."
+    required: false
+    default: "https://sbombox.com/install.sh"
+  api-url:
+    description: "SBOMBox API URL (self-hosted deployments)."
+    required: false
+    default: "https://api.sbombox.com"
+
+outputs:
+  sbom-path:
+    description: "Path of the generated SBOM."
+    value: ${{ steps.generate.outputs.sbom-path }}
+  score:
+    description: "Quality score, 0-10."
+    value: ${{ steps.score.outputs.score }}
+  grade:
+    description: "Letter grade for the score."
+    value: ${{ steps.score.outputs.grade }}
+  uploaded:
+    description: "true when the SBOM was uploaded."
+    value: ${{ steps.push.outputs.uploaded || 'false' }}
+  sbom-id:
+    description: "ID of the uploaded SBOM in SBOMBox."
+    value: ${{ steps.push.outputs.sbom-id }}
+  provenance-level:
+    description: "P2 when uploaded keylessly (identity verified by SBOMBox), P1 with a token, P0 otherwise."
+    value: ${{ steps.push.outputs.provenance-level }}
+  policy-status:
+    description: "pass or fail: the result of the fail-under gate."
+    value: ${{ steps.score.outputs.policy-status }}
+
+runs:
+  using: "composite"
+  steps:
+    # Inputs reach the scripts only as environment variables, never as
+    # ${{ }} text inside `run:`, so a crafted path or branch name cannot
+    # inject shell commands.
+    - name: Install SBOMBox CLI and SBOM generator
+      shell: bash
+      env:
+        SBOMBOX_VERSION: ${{ inputs.version != 'latest' && inputs.version || '' }}
+        SBOMBOX_SYFT_VERSION: ${{ inputs.syft-version }}
+        SBOMBOX_GENERATORS: ${{ inputs.generators }}
+        SBOMBOX_NO_MODIFY_PATH: "1"
+        INSTALLER_URL: ${{ inputs.installer-url }}
+      run: |
+        # One installer for the CLI and a pinned, checksum-verified generator.
+        # A CLI already on the runner is reused when no version is requested.
+        if [ -z "$SBOMBOX_VERSION" ] && command -v sbombox >/dev/null; then
+          export SBOMBOX_SKIP_CLI=1
+        fi
+        curl -fsSL "$INSTALLER_URL" | sh
+        echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+    - name: Generate SBOM
+      id: generate
+      shell: bash
+      env:
+        SCAN_PATH: ${{ inputs.path }}
+        FORMAT: ${{ inputs.format }}
+        OUTPUT: ${{ inputs.output }}
+        SBOMBOX_GENERATOR: ${{ inputs.generator }}
+        IMAGE: ${{ inputs.image }}
+        PLATFORM: ${{ inputs.platform }}
+      run: |
+        [ -n "$SBOMBOX_GENERATOR" ] || unset SBOMBOX_GENERATOR
+        if [ -n "$IMAGE" ]; then
+          set -- --image "$IMAGE"
+          [ -z "$PLATFORM" ] || set -- "$@" --platform "$PLATFORM"
+        else
+          set -- --dir "$SCAN_PATH"
+        fi
+        sbombox generate "$@" --format "$FORMAT" --output "$OUTPUT"
+        echo "sbom-path=$OUTPUT" >> "$GITHUB_OUTPUT"
+
+    - name: Score SBOM
+      id: score
+      shell: bash
+      env:
+        OUTPUT: ${{ inputs.output }}
+        FAIL_UNDER: ${{ inputs.fail-under }}
+      run: |
+        sbombox score "$OUTPUT" --format json > "$RUNNER_TEMP/sbombox-score.json"
+        python3 - "$RUNNER_TEMP/sbombox-score.json" "$FAIL_UNDER" >> "$GITHUB_OUTPUT" <<'PY'
+        import json, sys
+        result = json.load(open(sys.argv[1]))
+        total, threshold = float(result["total"]), float(sys.argv[2] or 0)
+        grade = result["grade"]["value"] if isinstance(result["grade"], dict) else result["grade"]
+        print(f"score={total:.1f}")
+        print(f"grade={grade}")
+        print(f"policy-status={'fail' if threshold > 0 and total < threshold else 'pass'}")
+        PY
+
+    - name: Check compliance
+      id: compliance
+      if: inputs.profiles != ''
+      shell: bash
+      env:
+        OUTPUT: ${{ inputs.output }}
+        PROFILES: ${{ inputs.profiles }}
+      run: |
+        : > "$RUNNER_TEMP/sbombox-compliance.md"
+        IFS=',' read -ra list <<< "$PROFILES"
+        for profile in "${list[@]}"; do
+          profile="$(echo "$profile" | xargs)"
+          [ -n "$profile" ] || continue
+          if ! sbombox compliance "$OUTPUT" --profile "$profile" --format json > "$RUNNER_TEMP/c.json"; then
+            echo "::warning title=SBOMBox compliance::$(tail -n 1 "$RUNNER_TEMP/c.json")"
+          fi
+          python3 - "$RUNNER_TEMP/c.json" "$profile" >> "$RUNNER_TEMP/sbombox-compliance.md" <<'PY'
+        import json, sys
+        try:
+            r = json.load(open(sys.argv[1]))
+            print(f"| Compliance: {sys.argv[2]} | {r['status'].replace('_', ' ')} ({r['overall']:.1f}/10) |")
+        except Exception:
+            print(f"| Compliance: {sys.argv[2]} | could not be checked |")
+        PY
+        done
+
+    - name: Upload to SBOMBox
+      id: push
+      shell: bash
+      env:
+        MODE: ${{ inputs.upload }}
+        OUTPUT: ${{ inputs.output }}
+        PROJECT: ${{ inputs.project }}
+        SBOMBOX_API_URL: ${{ inputs.api-url }}
+        INPUT_TOKEN: ${{ inputs.token }}
+      run: |
+        [ -n "$INPUT_TOKEN" ] && export SBOMBOX_TOKEN="$INPUT_TOKEN"
+        if [ "$MODE" = "false" ]; then
+          echo "Upload disabled."; exit 0
+        fi
+        if [ -z "${SBOMBOX_TOKEN:-}" ] && [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
+          msg="No credentials: add 'permissions: id-token: write' to the job (forked pull requests never get one)."
+          if [ "$MODE" = "true" ]; then echo "::error::$msg"; exit 5; fi
+          echo "::notice title=SBOMBox upload skipped::$msg"; exit 0
+        fi
+        sbombox push "$OUTPUT" --project "$PROJECT" --json > "$RUNNER_TEMP/sbombox-push.json"
+        python3 - "$RUNNER_TEMP/sbombox-push.json" >> "$GITHUB_OUTPUT" <<'PY'
+        import json, sys
+        r = json.load(open(sys.argv[1]))
+        print("uploaded=true")
+        print(f"sbom-id={r.get('id', '')}")
+        print(f"provenance-level={r.get('provenance_level', '')}")
+        PY
+
+    - name: Keep the SBOM with this run
+      if: always() && inputs.artifact-name != '' && steps.generate.outcome == 'success'
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      with:
+        name: ${{ inputs.artifact-name }}
+        path: |
+          ${{ inputs.output }}
+          ${{ runner.temp }}/sbombox-score.json
+        if-no-files-found: ignore
+        retention-days: 90
+
+    - name: Write job summary
+      if: always()
+      shell: bash
+      env:
+        SCORE: ${{ steps.score.outputs.score }}
+        GRADE: ${{ steps.score.outputs.grade }}
+        POLICY: ${{ steps.score.outputs.policy-status }}
+        FAIL_UNDER: ${{ inputs.fail-under }}
+        UPLOADED: ${{ steps.push.outputs.uploaded }}
+        SBOM_ID: ${{ steps.push.outputs.sbom-id }}
+        PROVENANCE: ${{ steps.push.outputs.provenance-level }}
+        GENERATED: ${{ steps.generate.outcome }}
+        IMAGE: ${{ inputs.image }}
+      run: |
+        {
+          echo "## SBOMBox"
+          echo
+          echo "| | |"
+          echo "|---|---|"
+          if [ "$GENERATED" != "success" ]; then
+            echo "| SBOM | generation failed, see the *Generate SBOM* step |"
+          else
+            echo "| Score | **${SCORE:-?}** / 10 (grade ${GRADE:-?}) |"
+            if [ "${FAIL_UNDER:-0}" != "0" ]; then echo "| Gate | ${POLICY:-?} (minimum ${FAIL_UNDER}) |"; fi
+            [ -f "$RUNNER_TEMP/sbombox-compliance.md" ] && cat "$RUNNER_TEMP/sbombox-compliance.md"
+            if [ "$UPLOADED" = "true" ]; then
+              echo "| Uploaded | \`${SBOM_ID}\` (provenance ${PROVENANCE}) |"
+            else
+              echo "| Uploaded | no |"
+            fi
+            [ -z "$IMAGE" ] || echo "| Image | \`${IMAGE}\` |"
+            echo "| Commit | \`${GITHUB_SHA:0:12}\` on ${GITHUB_HEAD_REF:-$GITHUB_REF_NAME} |"
+          fi
+        } >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Enforce minimum score
+      if: steps.score.outputs.policy-status == 'fail'
+      shell: bash
+      env:
+        SCORE: ${{ steps.score.outputs.score }}
+        FAIL_UNDER: ${{ inputs.fail-under }}
+      run: |
+        echo "::error title=SBOM score too low::Score ${SCORE} is below the minimum ${FAIL_UNDER}."
+        exit 1
